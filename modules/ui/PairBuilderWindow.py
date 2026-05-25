@@ -128,19 +128,27 @@ class PairBuilderWindow(ctk.CTkToplevel):
         self.ctk_image_a = ctk.CTkImage(light_image=dummy, size=(200, 200))
         self.ctk_image_b = ctk.CTkImage(light_image=dummy, size=(200, 200))
 
-        # Container A — cell을 채움, label은 안에서 center
+        # Container A — fixed-size cell; text label on top, image label centered below
         self._image_container_a = ctk.CTkFrame(self, fg_color="transparent")
         self._image_container_a.grid(row=3, column=0, padx=8, pady=4, sticky="nsew")
         self._image_container_a.grid_propagate(False)
+        self._image_container_a.grid_rowconfigure(0, weight=0)
+        self._image_container_a.grid_rowconfigure(1, weight=1)
+        self._image_container_a.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(self._image_container_a, text="A: Current LoRA", text_color="gray").grid(row=0, column=0, sticky="ew", pady=(2, 0))
         self.image_label_a = ctk.CTkLabel(self._image_container_a, text="", image=self.ctk_image_a)
-        self.image_label_a.place(relx=0.5, rely=0.5, anchor="center")
+        self.image_label_a.grid(row=1, column=0)
 
         # Container B
         self._image_container_b = ctk.CTkFrame(self, fg_color="transparent")
         self._image_container_b.grid(row=3, column=1, padx=8, pady=4, sticky="nsew")
         self._image_container_b.grid_propagate(False)
+        self._image_container_b.grid_rowconfigure(0, weight=0)
+        self._image_container_b.grid_rowconfigure(1, weight=1)
+        self._image_container_b.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(self._image_container_b, text="B: Reference (base/frozen)", text_color="gray").grid(row=0, column=0, sticky="ew", pady=(2, 0))
         self.image_label_b = ctk.CTkLabel(self._image_container_b, text="", image=self.ctk_image_b)
-        self.image_label_b.place(relx=0.5, rely=0.5, anchor="center")
+        self.image_label_b.grid(row=1, column=0)
 
         # Pick buttons
         self._pick_a_btn = ctk.CTkButton(self, text="Pick A", command=lambda: self.__pick("A"))
@@ -218,13 +226,9 @@ class PairBuilderWindow(ctk.CTkToplevel):
         sample_a.cfg_scale = max(base_cfg + delta, 1.0)
         sample_b.cfg_scale = max(base_cfg - delta, 1.0)
 
-        # Blind evaluation: 50% chance to swap which side uses the reference model.
-        # The user doesn't know which is current LoRA vs reference, so the Pick reflects
-        # honest visual preference and the learning signal self-corrects.
-        if random.random() < 0.5:
-            sample_a.use_reference_model = True
-        else:
-            sample_b.use_reference_model = True
+        # Fixed mapping: A = current LoRA (trained side), B = reference (base or frozen snapshot).
+        # Trainer-oriented view — the user wants to track training direction, not blind-label.
+        sample_b.use_reference_model = True
 
         self.commands.sample_custom(sample_a)
         self.commands.sample_custom(sample_b)
@@ -272,8 +276,16 @@ class PairBuilderWindow(ctk.CTkToplevel):
         label = self.image_label_a if slot == "A" else self.image_label_b
 
         self.update()
-        max_w = max(container.winfo_width() - 16, 200)
-        max_h = max(container.winfo_height() - 16, 200)
+        # CTkImage applies HiDPI widget scaling on top of the size we pass, so we must
+        # divide by the current widget scaling to compute a fitted pixel size that
+        # actually fits within container.winfo_width() (which is in logical pixels).
+        try:
+            scaling = ctk.ScalingTracker.get_widget_scaling(self)
+        except (AttributeError, Exception):
+            scaling = 1.0
+        max_w = max(int(container.winfo_width() * 0.92 / scaling), 200)
+        # Subtract ~30px for the "A:/B:" text label row at the top of the container.
+        max_h = max(int((container.winfo_height() - 30) * 0.92 / scaling), 200)
 
         ratio = min(max_w / pil_image.width, max_h / pil_image.height)
         new_w = max(int(pil_image.width * ratio), 1)
