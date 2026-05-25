@@ -78,7 +78,8 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         return concepts
 
     def __dpo_concept_pairs(self, config: TrainConfig, is_validation: bool = False) -> list[tuple[str, str]]:
-        return dpo_concept_pairs(self.__load_concepts(config), is_validation=is_validation)
+        allow_empty = getattr(config, "rlhf_interactive_mode", False)
+        return dpo_concept_pairs(self.__load_concepts(config), is_validation=is_validation, allow_empty=allow_empty)
 
     def _enumerate_input_modules(self, config: TrainConfig, allow_videos: bool = False) -> list:
         supported_extensions = set()

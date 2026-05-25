@@ -70,9 +70,9 @@ class PairByFilename(
                 pair_indices.append((chosen_index, rejected_index))
 
         pair_indices.sort(key=lambda x: x[0])
-        if not pair_indices:
-            raise RuntimeError("No DPO pairs could be matched by filename between the configured chosen/rejected concepts.")
 
+        # Empty pair list is allowed in interactive mode — training enters wait state and
+        # pairs will be added via PairBuilder before the first epoch runs.
         self._pair_indices = pair_indices
 
     def __get_pair_indices(self) -> list[tuple[int, int]]:

@@ -14,17 +14,19 @@ from modules.util.enum.DPOExecutionMode import DPOExecutionMode
 from modules.util.enum.RLHFMode import RLHFMode
 from modules.util.ui import components
 from modules.util.ui.UIState import UIState
+from modules.util.ui.validation import FieldValidator
 
 import customtkinter as ctk
 
 
 class RLHFTab:
-    def __init__(self, master, train_config: TrainConfig, ui_state: UIState):
+    def __init__(self, master, train_config: TrainConfig, ui_state: UIState, train_ui=None):
         super().__init__()
 
         self.master = master
         self.train_config = train_config
         self.ui_state = ui_state
+        self.train_ui = train_ui
 
         self.scroll_frame = None
 
@@ -105,16 +107,34 @@ class RLHFTab:
                                  "The best checkpoint is restored at the end of training.")
         components.switch(self.scroll_frame, 6, 4, self.ui_state, "rlhf_dpo_save_best")
 
-        components.button(self.scroll_frame, 7, 0, "Check Pairs", command=self._check_pairs,
-                          tooltip="Check that your chosen and rejected concept folders line up before training.")
-        components.button(self.scroll_frame, 7, 1, "Review Pairs", command=self._review_pairs,
-                          tooltip="Visually review your chosen/rejected image pairs. Remove bad pairs and their counterparts.")
-        components.button(self.scroll_frame, 7, 3, "DPO Bucket Analysis", command=self._bucket_analysis,
-                          tooltip="Show per-aspect-bucket pair counts and what to add or remove for clean batches at a given batch size.")
+        components.label(self.scroll_frame, 7, 3, "Interactive Mode",
+                         tooltip="Rescans the pair directory periodically during training to absorb newly added pairs from outside. Re-scan happens at the end of each loop (= current epochs setting).")
+        components.switch(self.scroll_frame, 7, 4, self.ui_state, "rlhf_interactive_mode")
 
-        components.label(self.scroll_frame, 8, 0, "Training Type:",
+        components.label(self.scroll_frame, 8, 3, "Total Loops",
+                         tooltip="Total number of loops to run in interactive mode. One loop equals the current 'epochs' setting. -1 means infinite loops until the user clicks Stop.")
+        components.entry(
+            self.scroll_frame, 8, 4, self.ui_state, "rlhf_interactive_total_loops",
+            tooltip="Total number of loops to run in interactive mode. One loop equals the current 'epochs' setting. -1 means infinite loops until the user clicks Stop.",
+            validator_factory=lambda comp, var, state, name, **kw: FieldValidator(comp, var, state, name, allow_negative=True, **kw),
+        )
+
+        components.label(self.scroll_frame, 8, 0, "Interactive Pairs Folder",
+                         tooltip="Folder where pairs auto-generated in interactive mode are stored. chosen/ and rejected/ subfolders are created automatically.")
+        components.path_entry(self.scroll_frame, 8, 1, self.ui_state, "rlhf_interactive_pairs_dir", mode="dir")
+
+        components.button(self.scroll_frame, 9, 0, "Check Pairs", command=self._check_pairs,
+                          tooltip="Check that your chosen and rejected concept folders line up before training.")
+        components.button(self.scroll_frame, 9, 1, "Review Pairs", command=self._review_pairs,
+                          tooltip="Visually review your chosen/rejected image pairs. Remove bad pairs and their counterparts.")
+        components.button(self.scroll_frame, 9, 3, "DPO Bucket Analysis", command=self._bucket_analysis,
+                          tooltip="Show per-aspect-bucket pair counts and what to add or remove for clean batches at a given batch size.")
+        components.button(self.scroll_frame, 9, 4, "Open Pair Builder", command=self._open_pair_builder,
+                          tooltip="Opens the interactive Pair Builder window. Generates two images with the same prompt and different seeds — pick A or B to register a pair.")
+
+        components.label(self.scroll_frame, 10, 0, "Training Type:",
                          tooltip="Shows whether DPO is starting from a fresh adapter or refining a loaded adapter. The output is always an adapter file.")
-        components.label(self.scroll_frame, 8, 1, training_type,
+        components.label(self.scroll_frame, 10, 1, training_type,
                          tooltip="DPO always writes an adapter file. New Adapter means the adapter starts from scratch. Existing Adapter means DPO refines a loaded adapter.")
 
     def _check_pairs(self):
@@ -241,6 +261,28 @@ class RLHFTab:
     def _bucket_analysis(self):
         from modules.ui.DPOBucketAnalysisWindow import DPOBucketAnalysisWindow
         DPOBucketAnalysisWindow(self.master.winfo_toplevel(), self.train_config)
+
+    def _open_pair_builder(self):
+        """Open PairBuilderWindow only when Interactive Mode is enabled and pairs_dir is set."""
+        if not self.train_config.rlhf_interactive_mode:
+            messagebox.showerror("Pair Builder", "Interactive Mode must be enabled first.")
+            return
+        if not self.train_config.rlhf_interactive_pairs_dir:
+            messagebox.showerror("Pair Builder", "Interactive Pairs Folder must be set first.")
+            return
+
+        callbacks, commands = (None, None)
+        if self.train_ui is not None:
+            callbacks, commands = self.train_ui.get_current_runtime()
+
+        from modules.ui.PairBuilderWindow import PairBuilderWindow
+        PairBuilderWindow(
+            self.master.winfo_toplevel(),
+            self.train_config,
+            callbacks=callbacks,
+            commands=commands,
+            train_ui=self.train_ui,
+        )
 
     def _load_concept_pairs(self):
         concepts = self._load_concepts()

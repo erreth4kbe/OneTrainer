@@ -108,7 +108,11 @@ def is_dpo_concept_type(concept_type: ConceptType) -> bool:
     }
 
 
-def dpo_concept_pairs(concepts: list[ConceptConfig], is_validation: bool = False) -> list[tuple[str, str]]:
+def dpo_concept_pairs(
+    concepts: list[ConceptConfig],
+    is_validation: bool = False,
+    allow_empty: bool = False,
+) -> list[tuple[str, str]]:
     enabled = [concept for concept in concepts if concept.enabled]
     chosen_type = ConceptType.DPO_CHOSEN_VAL if is_validation else ConceptType.DPO_CHOSEN
     rejected_type = ConceptType.DPO_REJECTED_VAL if is_validation else ConceptType.DPO_REJECTED
@@ -116,6 +120,10 @@ def dpo_concept_pairs(concepts: list[ConceptConfig], is_validation: bool = False
     rejected = [concept for concept in enabled if ConceptType(concept.type) == rejected_type]
 
     if not chosen and not rejected:
+        if allow_empty:
+            # Interactive mode: no pairs yet — training starts in wait state,
+            # pairs will be added via PairBuilder before the first epoch runs.
+            return []
         raise RuntimeError(
             f"Need explicit {chosen_type.value}/{rejected_type.value} concepts for RLHF DPO pairs."
         )
@@ -530,6 +538,88 @@ def scan_finalized_pairs(concept_pairs: list[tuple[str, str]]) -> list[dict]:
             }
 
     return list(all_pairs.values())
+
+
+def ensure_interactive_concepts(concept_file_name: str, pairs_dir: str) -> None:
+    """Ensure the pair folders (chosen/, rejected/) exist and DPO concept entries for them
+    are registered in the concept file. Skips entries that already have a matching
+    path + type combination."""
+    if not pairs_dir:
+        return
+
+    if not concept_file_name:
+        raise RuntimeError("concept_file_name must be set before calling ensure_interactive_concepts")
+
+    chosen_dir = os.path.abspath(os.path.join(pairs_dir, "chosen"))
+    rejected_dir = os.path.abspath(os.path.join(pairs_dir, "rejected"))
+    os.makedirs(chosen_dir, exist_ok=True)
+    os.makedirs(rejected_dir, exist_ok=True)
+
+    if os.path.isfile(concept_file_name):
+        with open(concept_file_name, "r", encoding="utf-8") as f:
+            concepts: list[dict] = json.load(f)
+    else:
+        concepts = []
+
+    candidates = [
+        (chosen_dir, ConceptType.DPO_CHOSEN, "RLHF Interactive Chosen"),
+        (rejected_dir, ConceptType.DPO_REJECTED, "RLHF Interactive Rejected"),
+    ]
+
+    changed = False
+    for abs_path, concept_type, concept_name in candidates:
+        norm_path = os.path.normcase(abs_path)
+        type_str = concept_type.value
+        already_present = any(
+            os.path.normcase(os.path.abspath(entry.get("path", ""))) == norm_path
+            and entry.get("type", "") == type_str
+            for entry in concepts
+        )
+        if already_present:
+            continue
+        new_concept = ConceptConfig.default_values()
+        new_concept.path = abs_path
+        new_concept.type = concept_type
+        new_concept.name = concept_name
+        new_concept.enabled = True
+        concepts.append(new_concept.to_dict())
+        changed = True
+
+    if changed:
+        with open(concept_file_name, "w", encoding="utf-8") as f:
+            json.dump(concepts, f, indent=2)
+
+
+def cleanup_interactive_concepts(concept_file_name: str, pairs_dir: str) -> None:
+    """Remove the auto-registered interactive pair concepts from the concept file and delete the pair folders.
+    Matches concepts by both path AND name (RLHF Interactive Chosen/Rejected) to avoid touching user-created concepts."""
+    if not pairs_dir:
+        return
+
+    chosen_abs = os.path.normcase(os.path.abspath(os.path.join(pairs_dir, "chosen")))
+    rejected_abs = os.path.normcase(os.path.abspath(os.path.join(pairs_dir, "rejected")))
+    candidates = {
+        chosen_abs: "RLHF Interactive Chosen",
+        rejected_abs: "RLHF Interactive Rejected",
+    }
+
+    if concept_file_name and os.path.isfile(concept_file_name):
+        with open(concept_file_name, "r", encoding="utf-8") as f:
+            concepts: list[dict] = json.load(f)
+
+        filtered = [
+            entry for entry in concepts
+            if not (
+                os.path.normcase(os.path.abspath(entry.get("path", ""))) in candidates
+                and entry.get("name", "") == candidates[os.path.normcase(os.path.abspath(entry.get("path", "")))]
+            )
+        ]
+        if len(filtered) != len(concepts):
+            with open(concept_file_name, "w", encoding="utf-8") as f:
+                json.dump(filtered, f, indent=2)
+
+    shutil.rmtree(os.path.join(pairs_dir, "chosen"), ignore_errors=True)
+    shutil.rmtree(os.path.join(pairs_dir, "rejected"), ignore_errors=True)
 
 
 def remove_finalized_pair(chosen_path: str | None, rejected_path: str | None):

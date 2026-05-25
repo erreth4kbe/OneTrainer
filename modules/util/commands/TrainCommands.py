@@ -9,6 +9,7 @@ class TrainCommands:
     ):
         self.reset()
         self.__stop_command = False
+        self.__resume_command = False
         self.__on_command = on_command
 
     def reset(self):
@@ -36,6 +37,16 @@ class TrainCommands:
 
     def get_stop_command(self) -> bool:
         return self.__stop_command
+
+    def resume(self):
+        self.__resume_command = True
+        if self.__on_command:
+            self.__on_command(self)
+
+    def get_and_reset_resume_command(self) -> bool:
+        resume_command = self.__resume_command
+        self.__resume_command = False
+        return resume_command
 
     def sample_custom(self, sample_params: SampleConfig):
         self.__sample_custom_commands.append(sample_params)

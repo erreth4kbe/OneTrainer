@@ -144,6 +144,7 @@ class SampleConfig(BaseConfig):
     random_seed: bool
     diffusion_steps: int
     cfg_scale: float
+    use_reference_model: bool
     noise_scheduler: NoiseScheduler
 
     text_encoder_1_layer_skip: int
@@ -188,6 +189,7 @@ class SampleConfig(BaseConfig):
         data.append(("random_seed", False, bool, False))
         data.append(("diffusion_steps", defaults["diffusion_steps"], int, False))
         data.append(("cfg_scale", defaults["cfg_scale"], float, False))
+        data.append(("use_reference_model", False, bool, False))
         data.append(("noise_scheduler", defaults["noise_scheduler"], NoiseScheduler, False))
 
         data.append(("text_encoder_1_layer_skip", 0, int, False))

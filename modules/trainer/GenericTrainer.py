@@ -4,6 +4,7 @@ import json
 import math
 import os
 import shutil
+import time
 import traceback
 from collections.abc import Callable
 from pathlib import Path
@@ -268,15 +269,26 @@ class GenericTrainer(BaseTrainer):
                 sample_config = copy.copy(sample_config)
                 sample_config.from_train_config(self.config)
 
-                self.model_sampler.sample(
-                    sample_config=sample_config,
-                    destination=sample_path,
-                    image_format=self.config.sample_image_format,
-                    video_format=self.config.sample_video_format,
-                    audio_format=self.config.sample_audio_format,
-                    on_sample=on_sample,
-                    on_update_progress=on_update_progress,
-                )
+                def _do_sample():
+                    self.model_sampler.sample(
+                        sample_config=sample_config,
+                        destination=sample_path,
+                        image_format=self.config.sample_image_format,
+                        video_format=self.config.sample_video_format,
+                        audio_format=self.config.sample_audio_format,
+                        on_sample=on_sample,
+                        on_update_progress=on_update_progress,
+                    )
+
+                if sample_config.use_reference_model:
+                    try:
+                        with self.model_setup.reference_model(self.model, self.config):
+                            _do_sample()
+                    except (RuntimeError, NotImplementedError) as ex:
+                        print(f"[PairBuilder] reference_model unavailable ({ex}), falling back to current model")
+                        _do_sample()
+                else:
+                    _do_sample()
             except Exception:
                 traceback.print_exc()
                 print("Error during sampling, proceeding without sampling")
@@ -703,6 +715,31 @@ class GenericTrainer(BaseTrainer):
             torch.clear_autocast_cache()
             self.model.optimizer.eval()
 
+    def __wait_for_user_resume(self) -> bool:
+        """Block until Resume is clicked, processing sample_custom commands in the meantime."""
+        self.callbacks.on_internal_state_changed("waiting")
+        self.model.eval()
+
+        while True:
+            multi.sync_commands(self.commands)
+
+            if self.commands.get_stop_command():
+                return False  # stop received during wait
+
+            if self.commands.get_and_reset_resume_command():
+                return True  # user resumed
+
+            sample_commands = self.commands.get_and_reset_sample_custom_commands()
+            if sample_commands:
+                def create_wait_sample_fun(cmds):
+                    def fun():
+                        self.__sample_during_training(self.model.train_progress, torch.device(self.config.train_device), cmds)
+                    return fun
+                self.__enqueue_sample_during_training(create_wait_sample_fun(sample_commands))
+                self.__execute_sample_during_training()
+
+            time.sleep(0.1)
+
     def train(self):
         train_device = torch.device(self.config.train_device)
 
@@ -728,237 +765,272 @@ class GenericTrainer(BaseTrainer):
         accumulated_dpo_metrics: dict[str, float] | None = None
         ema_loss = None
         ema_loss_steps = 0
-        epochs = range(train_progress.epoch, self.config.epochs, 1)
 
-        for _epoch in tqdm(epochs, desc="epoch") if multi.is_master() else epochs:
-            multi.sync_commands(self.commands)
-            if self.commands.get_stop_command():
-                return
-            self.callbacks.on_update_status("Starting epoch/caching")
+        loop_idx = 0
+        total_loops = self.config.rlhf_interactive_total_loops if self.config.rlhf_interactive_mode else 1
 
-            #call start_next_epoch with only one process at first, because it might write to the cache. All subsequent processes can read in parallel:
-            for _ in multi.master_first():
-                if self.config.latent_caching:
-                    self.data_loader.get_data_set().start_next_epoch()
-                    self.model_setup.setup_train_device(self.model, self.config)
-                else:
-                    self.model_setup.setup_train_device(self.model, self.config)
-                    self.data_loader.get_data_set().start_next_epoch()
+        while True:
+            if multi.is_master() and self.config.rlhf_interactive_mode:
+                total_str = str(total_loops) if total_loops != -1 else "∞"
+                print(f"[Interactive Loop {loop_idx + 1}/{total_str}]")
 
-            if self.config.debug_mode:
-                multi.warn_parameter_divergence(self.parameters, train_device)
-
-            # Special case for schedule-free optimizers, which need train()
-            # called before training. Can and should move this to a callback
-            # during a refactoring.
-            if self.config.optimizer.optimizer.is_schedule_free:
-                torch.clear_autocast_cache()
-                self.model.optimizer.train()
-
-            torch_gc()
-
-            if lr_scheduler is None:
-                lr_scheduler = create.create_lr_scheduler(
-                    config=self.config,
-                    optimizer=self.model.optimizer,
-                    learning_rate_scheduler=self.config.learning_rate_scheduler,
-                    warmup_steps=self.config.learning_rate_warmup_steps,
-                    num_cycles=self.config.learning_rate_cycles,
-                    min_factor=self.config.learning_rate_min_factor,
-                    num_epochs=self.config.epochs,
-                    approximate_epoch_length=self.data_loader.get_data_set().approximate_length(),
-                    batch_size=self.config.batch_size,
-                    gradient_accumulation_steps=self.config.gradient_accumulation_steps,
-                    global_step=train_progress.global_step
-                )
-
-            current_epoch_length = self.data_loader.get_data_set().approximate_length()
-
-            if multi.is_master():
-                batches = step_tqdm = tqdm(self.data_loader.get_data_loader(), desc="step", total=current_epoch_length,
-                                 initial=train_progress.epoch_step)
+            if self.config.rlhf_interactive_mode:
+                epochs = range(train_progress.epoch, train_progress.epoch + self.config.epochs, 1)
             else:
-                batches = self.data_loader.get_data_loader()
-            for batch in batches:
+                epochs = range(train_progress.epoch, self.config.epochs, 1)
+
+            if self.config.rlhf_interactive_mode and loop_idx == 0:
+                resumed = self.__wait_for_user_resume()
+                if not resumed:
+                    return  # stop received during wait
+                # Rebuild dataloader to include any pairs added during wait
+                self.data_loader = self.create_data_loader(self.model, self.model_setup, train_progress)
+                if self.config.validation or self.config.rlhf_dpo_validation:
+                    self.validation_data_loader = self.create_data_loader(self.model, self.model_setup, train_progress, is_validation=True)
+                self.callbacks.on_internal_state_changed("running")
+
+            if loop_idx > 0:
+                self.callbacks.on_update_status(f"Loop {loop_idx + 1} 시작 (데이터 재스캔 중)")
+                self.data_loader = self.create_data_loader(self.model, self.model_setup, train_progress)
+                if self.config.validation or self.config.rlhf_dpo_validation:
+                    self.validation_data_loader = self.create_data_loader(self.model, self.model_setup, train_progress, is_validation=True)
+                lr_scheduler = None
+
+            for _epoch in tqdm(epochs, desc="epoch") if multi.is_master() else epochs:
                 multi.sync_commands(self.commands)
                 if self.commands.get_stop_command():
+                    return
+                self.callbacks.on_update_status("Starting epoch/caching")
+
+                #call start_next_epoch with only one process at first, because it might write to the cache. All subsequent processes can read in parallel:
+                for _ in multi.master_first():
+                    if self.config.latent_caching:
+                        self.data_loader.get_data_set().start_next_epoch()
+                        self.model_setup.setup_train_device(self.model, self.config)
+                    else:
+                        self.model_setup.setup_train_device(self.model, self.config)
+                        self.data_loader.get_data_set().start_next_epoch()
+
+                if self.config.debug_mode:
                     multi.warn_parameter_divergence(self.parameters, train_device)
 
-                if not self.commands.get_stop_command() and self.__needs_sample(train_progress) or self.commands.get_and_reset_sample_default_command():
-                    self.__enqueue_sample_during_training(
-                        lambda: self.__sample_during_training(train_progress, train_device)
+                # Special case for schedule-free optimizers, which need train()
+                # called before training. Can and should move this to a callback
+                # during a refactoring.
+                if self.config.optimizer.optimizer.is_schedule_free:
+                    torch.clear_autocast_cache()
+                    self.model.optimizer.train()
+
+                torch_gc()
+
+                if lr_scheduler is None:
+                    lr_scheduler = create.create_lr_scheduler(
+                        config=self.config,
+                        optimizer=self.model.optimizer,
+                        learning_rate_scheduler=self.config.learning_rate_scheduler,
+                        warmup_steps=self.config.learning_rate_warmup_steps,
+                        num_cycles=self.config.learning_rate_cycles,
+                        min_factor=self.config.learning_rate_min_factor,
+                        num_epochs=self.config.epochs,
+                        approximate_epoch_length=self.data_loader.get_data_set().approximate_length(),
+                        batch_size=self.config.batch_size,
+                        gradient_accumulation_steps=self.config.gradient_accumulation_steps,
+                        global_step=train_progress.global_step
                     )
-                if self.__needs_backup(train_progress):
-                    self.commands.backup()
 
-                if self.__needs_save(train_progress):
-                    self.commands.save()
+                current_epoch_length = self.data_loader.get_data_set().approximate_length()
 
-                sample_commands = self.commands.get_and_reset_sample_custom_commands()
-                if sample_commands:
-                    def create_sample_commands_fun(sample_commands):
-                        def sample_commands_fun():
-                            self.__sample_during_training(train_progress, train_device, sample_commands)
+                if multi.is_master():
+                    batches = step_tqdm = tqdm(self.data_loader.get_data_loader(), desc="step", total=current_epoch_length,
+                                     initial=train_progress.epoch_step)
+                else:
+                    batches = self.data_loader.get_data_loader()
+                for batch in batches:
+                    multi.sync_commands(self.commands)
+                    if self.commands.get_stop_command():
+                        multi.warn_parameter_divergence(self.parameters, train_device)
 
-                        return sample_commands_fun
-
-                    self.__enqueue_sample_during_training(create_sample_commands_fun(sample_commands))
-
-                if self.__needs_gc(train_progress):
-                    torch_gc()
-
-                if not has_gradient:
-                    self.__execute_sample_during_training()
-                    backup = self.commands.get_and_reset_backup_command()
-                    save = self.commands.get_and_reset_save_command()
-                    if multi.is_master() and (backup or save):
-                        self.model.to(self.temp_device)
-                        if backup:
-                            self.__backup(train_progress, True, step_tqdm.write)
-                        if save:
-                            self.__save(train_progress, True, step_tqdm.write)
-                        self.model_setup.setup_train_device(self.model, self.config)
-
-                self.callbacks.on_update_status("Training ...")
-
-                with (
-                    TorchMemoryRecorder(enabled=False, filename=f"memory-step{train_progress.global_step}.pickle"),
-                    TorchProfiler      (enabled=False, filename=f"profile-step{train_progress.global_step}.json"),
-                ):
-                    step_seed = train_progress.global_step
-                    bf16_stochastic_rounding_set_seed(step_seed, train_device)
-
-                    if self.config.rlhf_enabled:
-                        loss = self.model_setup.calculate_dpo_loss(
-                            self.model, batch, self.config, train_progress
+                    if not self.commands.get_stop_command() and self.__needs_sample(train_progress) or self.commands.get_and_reset_sample_default_command():
+                        self.__enqueue_sample_during_training(
+                            lambda: self.__sample_during_training(train_progress, train_device)
                         )
-                        # Accumulate per-micro-batch DPO metrics across the grad-accum window.
-                        # Without this, only the final micro-batch's metric reaches TensorBoard —
-                        # which produces 0.0/1.0 accuracy when batch_size=1 regardless of effective batch.
-                        micro_dpo_metrics = self.model_setup.get_last_dpo_metrics()
-                        if accumulated_dpo_metrics is None:
-                            accumulated_dpo_metrics = dict.fromkeys(micro_dpo_metrics, 0.0)
-                            accumulated_dpo_metrics['_count'] = 0
-                        for _k, _v in micro_dpo_metrics.items():
-                            accumulated_dpo_metrics[_k] += _v
-                        accumulated_dpo_metrics['_count'] += 1
-                    else:
-                        # Standard training path
-                        prior_pred_indices = [i for i in range(self.config.batch_size)
-                                              if ConceptType(batch['concept_type'][i]) == ConceptType.PRIOR_PREDICTION]
-                        if len(prior_pred_indices) > 0 \
-                                or (self.config.masked_training
-                                    and self.config.masked_prior_preservation_weight > 0
-                                    and self.config.training_method == TrainingMethod.LORA):
-                            with self.model_setup.prior_model(self.model, self.config), torch.no_grad():
-                                #do NOT create a subbatch using the indices, even though it would be more efficient:
-                                #different timesteps are used for a smaller subbatch by predict(), but the conditioning must match exactly:
-                                prior_model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
-                            model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
-                            prior_model_prediction = prior_model_output_data['predicted'].to(dtype=model_output_data['target'].dtype)
-                            model_output_data['target'][prior_pred_indices] = prior_model_prediction[prior_pred_indices]
-                            model_output_data['prior_target'] = prior_model_prediction
-                        else:
-                            model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
+                    if self.__needs_backup(train_progress):
+                        self.commands.backup()
 
-                        loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config)
+                    if self.__needs_save(train_progress):
+                        self.commands.save()
 
-                    loss = loss / self.config.gradient_accumulation_steps
-                    if scaler:
-                        scaler.scale(loss).backward()
-                    else:
-                        loss.backward()
+                    sample_commands = self.commands.get_and_reset_sample_custom_commands()
+                    if sample_commands:
+                        def create_sample_commands_fun(sample_commands):
+                            def sample_commands_fun():
+                                self.__sample_during_training(train_progress, train_device, sample_commands)
 
-                    has_gradient = True
-                    detached_loss = loss.detach()
-                    multi.reduce_tensor_mean(detached_loss)
-                    accumulated_loss += detached_loss
+                            return sample_commands_fun
 
-                    if self.__is_update_step(train_progress):
-                        if self.config.fused_gradient_reduce:
-                            multi.finish_async(self.config.gradient_reduce_precision)
-                        else:
-                            multi.reduce_grads_mean(self.parameters, self.config.gradient_reduce_precision)
+                        self.__enqueue_sample_during_training(create_sample_commands_fun(sample_commands))
 
-                        if scaler and self.config.optimizer.optimizer.supports_fused_back_pass() and self.config.optimizer.fused_back_pass:
-                            scaler.step_after_unscale_parameter_(self.model.optimizer)
-                            scaler.update()
-                        elif scaler:
-                            scaler.unscale_(self.model.optimizer)
-                            if self.config.clip_grad_norm is not None:
-                                nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
-                            scaler.step(self.model.optimizer)
-                            scaler.update()
-                        else:
-                            if self.config.clip_grad_norm is not None:
-                                nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
-                            self.model.optimizer.step()
+                    if self.__needs_gc(train_progress):
+                        torch_gc()
 
-                        lr_scheduler.step()  # done before zero_grad, because some lr schedulers need gradients
-                        self.model.optimizer.zero_grad(set_to_none=True)
-                        has_gradient = False
+                    if not has_gradient:
+                        self.__execute_sample_during_training()
+                        backup = self.commands.get_and_reset_backup_command()
+                        save = self.commands.get_and_reset_save_command()
+                        if multi.is_master() and (backup or save):
+                            self.model.to(self.temp_device)
+                            if backup:
+                                self.__backup(train_progress, True, step_tqdm.write)
+                            if save:
+                                self.__save(train_progress, True, step_tqdm.write)
+                            self.model_setup.setup_train_device(self.model, self.config)
 
-                        if multi.is_master():
-                            self.model_setup.report_to_tensorboard(
-                                self.model, self.config, lr_scheduler, self.tensorboard
+                    self.callbacks.on_update_status("Training ...")
+
+                    with (
+                        TorchMemoryRecorder(enabled=False, filename=f"memory-step{train_progress.global_step}.pickle"),
+                        TorchProfiler      (enabled=False, filename=f"profile-step{train_progress.global_step}.json"),
+                    ):
+                        step_seed = train_progress.global_step
+                        bf16_stochastic_rounding_set_seed(step_seed, train_device)
+
+                        if self.config.rlhf_enabled:
+                            loss = self.model_setup.calculate_dpo_loss(
+                                self.model, batch, self.config, train_progress
                             )
+                            # Accumulate per-micro-batch DPO metrics across the grad-accum window.
+                            # Without this, only the final micro-batch's metric reaches TensorBoard —
+                            # which produces 0.0/1.0 accuracy when batch_size=1 regardless of effective batch.
+                            micro_dpo_metrics = self.model_setup.get_last_dpo_metrics()
+                            if accumulated_dpo_metrics is None:
+                                accumulated_dpo_metrics = dict.fromkeys(micro_dpo_metrics, 0.0)
+                                accumulated_dpo_metrics['_count'] = 0
+                            for _k, _v in micro_dpo_metrics.items():
+                                accumulated_dpo_metrics[_k] += _v
+                            accumulated_dpo_metrics['_count'] += 1
+                        else:
+                            # Standard training path
+                            prior_pred_indices = [i for i in range(self.config.batch_size)
+                                                  if ConceptType(batch['concept_type'][i]) == ConceptType.PRIOR_PREDICTION]
+                            if len(prior_pred_indices) > 0 \
+                                    or (self.config.masked_training
+                                        and self.config.masked_prior_preservation_weight > 0
+                                        and self.config.training_method == TrainingMethod.LORA):
+                                with self.model_setup.prior_model(self.model, self.config), torch.no_grad():
+                                    #do NOT create a subbatch using the indices, even though it would be more efficient:
+                                    #different timesteps are used for a smaller subbatch by predict(), but the conditioning must match exactly:
+                                    prior_model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
+                                model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
+                                prior_model_prediction = prior_model_output_data['predicted'].to(dtype=model_output_data['target'].dtype)
+                                model_output_data['target'][prior_pred_indices] = prior_model_prediction[prior_pred_indices]
+                                model_output_data['prior_target'] = prior_model_prediction
+                            else:
+                                model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
 
-                            accumulated_loss_cpu = accumulated_loss.item()
-                            if math.isnan(accumulated_loss_cpu):
-                                raise RuntimeError("Training loss became NaN. This may be due to invalid parameters, precision issues, or a bug in the loss computation.")
+                            loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config)
 
-                            self.tensorboard.add_scalar("loss/train_step",accumulated_loss_cpu , train_progress.global_step)
-                            if self.config.rlhf_enabled and accumulated_dpo_metrics is not None:
-                                count = accumulated_dpo_metrics.pop('_count')
-                                dpo_metrics = {k: v / count for k, v in accumulated_dpo_metrics.items()}
-                                self.tensorboard.add_scalar("loss/dpo", dpo_metrics['loss'], train_progress.global_step)
-                                self.tensorboard.add_scalar("dpo/raw_loss", dpo_metrics['dpo_loss'], train_progress.global_step)
-                                self.tensorboard.add_scalar("dpo/chosen_reward", dpo_metrics['chosen_reward'], train_progress.global_step)
-                                self.tensorboard.add_scalar("dpo/rejected_reward", dpo_metrics['rejected_reward'], train_progress.global_step)
-                                self.tensorboard.add_scalar("dpo/accuracy", dpo_metrics['accuracy'], train_progress.global_step)
-                            ema_loss = ema_loss or accumulated_loss_cpu
-                            ema_loss_steps += 1
-                            ema_loss_decay = min(0.99, 1 - (1 / ema_loss_steps))
-                            ema_loss = (ema_loss * ema_loss_decay) + (accumulated_loss_cpu * (1 - ema_loss_decay))
-                            step_tqdm.set_postfix({
-                                'loss': accumulated_loss_cpu,
-                                'smooth loss': ema_loss,
-                            })
-                            self.tensorboard.add_scalar("smooth_loss/train_step", ema_loss, train_progress.global_step)
+                        loss = loss / self.config.gradient_accumulation_steps
+                        if scaler:
+                            scaler.scale(loss).backward()
+                        else:
+                            loss.backward()
 
-                        accumulated_loss = 0.0
-                        accumulated_dpo_metrics = None
-                        self.model_setup.after_optimizer_step(self.model, self.config, train_progress)
+                        has_gradient = True
+                        detached_loss = loss.detach()
+                        multi.reduce_tensor_mean(detached_loss)
+                        accumulated_loss += detached_loss
 
-                        if self.model.ema:
-                            assert multi.is_master()
-                            update_step = train_progress.global_step // self.config.gradient_accumulation_steps
-                            self.tensorboard.add_scalar(
-                                "ema_decay",
-                                self.model.ema.get_current_decay(update_step),
-                                train_progress.global_step
-                            )
-                            self.model.ema.step(
-                                self.parameters,
-                                update_step
-                            )
+                        if self.__is_update_step(train_progress):
+                            if self.config.fused_gradient_reduce:
+                                multi.finish_async(self.config.gradient_reduce_precision)
+                            else:
+                                multi.reduce_grads_mean(self.parameters, self.config.gradient_reduce_precision)
 
-                        self.one_step_trained = True
+                            if scaler and self.config.optimizer.optimizer.supports_fused_back_pass() and self.config.optimizer.fused_back_pass:
+                                scaler.step_after_unscale_parameter_(self.model.optimizer)
+                                scaler.update()
+                            elif scaler:
+                                scaler.unscale_(self.model.optimizer)
+                                if self.config.clip_grad_norm is not None:
+                                    nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
+                                scaler.step(self.model.optimizer)
+                                scaler.update()
+                            else:
+                                if self.config.clip_grad_norm is not None:
+                                    nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
+                                self.model.optimizer.step()
 
-                if (self.config.validation or self.config.rlhf_dpo_validation) and multi.is_master():
-                    self.__validate(train_progress)
+                            lr_scheduler.step()  # done before zero_grad, because some lr schedulers need gradients
+                            self.model.optimizer.zero_grad(set_to_none=True)
+                            has_gradient = False
 
-                train_progress.next_step(self.config.batch_size)
+                            if multi.is_master():
+                                self.model_setup.report_to_tensorboard(
+                                    self.model, self.config, lr_scheduler, self.tensorboard
+                                )
+
+                                accumulated_loss_cpu = accumulated_loss.item()
+                                if math.isnan(accumulated_loss_cpu):
+                                    raise RuntimeError("Training loss became NaN. This may be due to invalid parameters, precision issues, or a bug in the loss computation.")
+
+                                self.tensorboard.add_scalar("loss/train_step",accumulated_loss_cpu , train_progress.global_step)
+                                if self.config.rlhf_enabled and accumulated_dpo_metrics is not None:
+                                    count = accumulated_dpo_metrics.pop('_count')
+                                    dpo_metrics = {k: v / count for k, v in accumulated_dpo_metrics.items()}
+                                    self.tensorboard.add_scalar("loss/dpo", dpo_metrics['loss'], train_progress.global_step)
+                                    self.tensorboard.add_scalar("dpo/raw_loss", dpo_metrics['dpo_loss'], train_progress.global_step)
+                                    self.tensorboard.add_scalar("dpo/chosen_reward", dpo_metrics['chosen_reward'], train_progress.global_step)
+                                    self.tensorboard.add_scalar("dpo/rejected_reward", dpo_metrics['rejected_reward'], train_progress.global_step)
+                                    self.tensorboard.add_scalar("dpo/accuracy", dpo_metrics['accuracy'], train_progress.global_step)
+                                ema_loss = ema_loss or accumulated_loss_cpu
+                                ema_loss_steps += 1
+                                ema_loss_decay = min(0.99, 1 - (1 / ema_loss_steps))
+                                ema_loss = (ema_loss * ema_loss_decay) + (accumulated_loss_cpu * (1 - ema_loss_decay))
+                                step_tqdm.set_postfix({
+                                    'loss': accumulated_loss_cpu,
+                                    'smooth loss': ema_loss,
+                                })
+                                self.tensorboard.add_scalar("smooth_loss/train_step", ema_loss, train_progress.global_step)
+
+                            accumulated_loss = 0.0
+                            accumulated_dpo_metrics = None
+                            self.model_setup.after_optimizer_step(self.model, self.config, train_progress)
+
+                            if self.model.ema:
+                                assert multi.is_master()
+                                update_step = train_progress.global_step // self.config.gradient_accumulation_steps
+                                self.tensorboard.add_scalar(
+                                    "ema_decay",
+                                    self.model.ema.get_current_decay(update_step),
+                                    train_progress.global_step
+                                )
+                                self.model.ema.step(
+                                    self.parameters,
+                                    update_step
+                                )
+
+                            self.one_step_trained = True
+
+                    if (self.config.validation or self.config.rlhf_dpo_validation) and multi.is_master():
+                        self.__validate(train_progress)
+
+                    train_progress.next_step(self.config.batch_size)
+                    self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
+
+                    if self.commands.get_stop_command():
+                        return
+
+                train_progress.next_epoch()
                 self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
 
                 if self.commands.get_stop_command():
                     return
 
-            train_progress.next_epoch()
-            self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
-
-            if self.commands.get_stop_command():
-                return
+            loop_idx += 1
+            if not self.config.rlhf_interactive_mode:
+                break
+            if total_loops != -1 and loop_idx >= total_loops:
+                break
 
     def end(self):
         if self.one_step_trained:

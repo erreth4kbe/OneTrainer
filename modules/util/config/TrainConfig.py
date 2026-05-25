@@ -549,6 +549,10 @@ class TrainConfig(BaseConfig):
     rlhf_dpo_patience_value: int
     rlhf_dpo_patience_mode: DPOPatienceMode
     rlhf_dpo_save_best: bool
+    rlhf_interactive_mode: bool
+    rlhf_interactive_total_loops: int
+    rlhf_interactive_pairs_dir: str
+    rlhf_interactive_cleanup_on_stop: bool
 
     # optimizer
     optimizer: TrainOptimizerConfig
@@ -604,6 +608,7 @@ class TrainConfig(BaseConfig):
                 13: self.__migration_13,
                 14: self.__migration_14,
                 15: self.__migration_15,
+                16: self.__migration_16,
             }
         )
 
@@ -863,6 +868,14 @@ class TrainConfig(BaseConfig):
     def __migration_15(self, data: dict) -> dict:
         migrated_data = data.copy()
         migrated_data.setdefault("rlhf_dpo_save_best", True)
+        return migrated_data
+
+    def __migration_16(self, data: dict) -> dict:
+        migrated_data = data.copy()
+        migrated_data.setdefault("rlhf_interactive_mode", False)
+        migrated_data.setdefault("rlhf_interactive_total_loops", 1)
+        migrated_data.setdefault("rlhf_interactive_pairs_dir", "")
+        migrated_data.setdefault("rlhf_interactive_cleanup_on_stop", False)
         return migrated_data
 
     def effective_dpo_ref_mode(self) -> DPORefMode:
@@ -1252,6 +1265,10 @@ class TrainConfig(BaseConfig):
         data.append(("rlhf_dpo_patience_value", 5, int, False))
         data.append(("rlhf_dpo_patience_mode", DPOPatienceMode.EITHER, DPOPatienceMode, False))
         data.append(("rlhf_dpo_save_best", True, bool, False))
+        data.append(("rlhf_interactive_mode", False, bool, False))
+        data.append(("rlhf_interactive_total_loops", 1, int, False))
+        data.append(("rlhf_interactive_pairs_dir", "", str, False))
+        data.append(("rlhf_interactive_cleanup_on_stop", False, bool, False))
 
         # optimizer
         data.append(("optimizer", TrainOptimizerConfig.default_values(), TrainOptimizerConfig, False))
