@@ -37,3 +37,8 @@ pixi.toml
 train.bat
 debug_report.log
 config_diff.txt
+
+# personal scratch (test logs, local notes, etc.)
+_test*
+*.local.*
+*.scratch
