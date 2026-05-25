@@ -1,5 +1,6 @@
 import ctypes
 import datetime
+import glob
 import json
 import os
 import platform
@@ -23,6 +24,7 @@ from modules.ui.ConvertModelUI import ConvertModelUI
 from modules.ui.LoraTab import LoraTab
 from modules.ui.ModelTab import ModelTab
 from modules.ui.ProfilingWindow import ProfilingWindow
+from modules.ui.RLHFTab import RLHFTab
 from modules.ui.SampleWindow import SampleWindow
 from modules.ui.SamplingTab import SamplingTab
 from modules.ui.TopBar import TopBar
@@ -76,7 +78,7 @@ class TrainUI(ctk.CTk):
             "text_color_disabled": "white",
         },
         "running": {
-            "text": "Stop Training",
+            "text": "Stop",
             "state": "normal",
             "fg_color": "#dc3545",
             "hover_color": "#bb2d3b",
@@ -89,6 +91,13 @@ class TrainUI(ctk.CTk):
             "hover_color": "#dc3545",
             "text_color": "white",
             "text_color_disabled": "white",
+        },
+        "waiting": {
+            "text": "Ready",
+            "state": "normal",
+            "fg_color": "#0d6efd",
+            "hover_color": "#0b5ed7",
+            "text_color": "white",
         },
     }
 
@@ -121,16 +130,20 @@ class TrainUI(ctk.CTk):
         self.model_tab = None
         self.training_tab = None
         self.lora_tab = None
+        self.rlhf_tab = None
         self.cloud_tab = None
         self.additional_embeddings_tab = None
-
-        self.top_bar_component = self.top_bar(self)
-        self.content_frame(self)
-        self.bottom_bar(self)
 
         self.training_thread = None
         self.training_callbacks = None
         self.training_commands = None
+        self._training_state_listeners: list = []
+        self._is_waiting = False
+        self._main_start_button_locked: bool = False
+
+        self.top_bar_component = self.top_bar(self)
+        self.content_frame(self)
+        self.bottom_bar(self)
 
         self.start_time = None
         self.start_total_steps = None
@@ -561,6 +574,10 @@ class TrainUI(ctk.CTk):
                          tooltip="Open the profiling tools.")
         components.button(frame, 4, 1, "Open", self.open_profiling_tool)
 
+        components.label(frame, 5, 0, "DPO Pair Tool",
+                         tooltip="Score generated images and create chosen/rejected preference pair folders for DPO training")
+        components.button(frame, 5, 1, "Open", self.open_dpo_curation_tool)
+
         frame.pack(fill="both", expand=1)
         return frame
 
@@ -592,12 +609,36 @@ class TrainUI(ctk.CTk):
         if training_method == TrainingMethod.EMBEDDING and "embedding" not in self.tabview._tab_dict:
             self.embedding_tab(self.tabview.add("embedding"))
 
+        self._update_rlhf_controls()
+        self._update_rlhf_tab()
+
+    def _rlhf_is_supported(self) -> bool:
+        return self.train_config.training_method == TrainingMethod.LORA
+
+    def _update_rlhf_controls(self):
+        if self.rlhf_tab:
+            self.rlhf_tab.refresh_ui()
+
+    def _update_rlhf_tab(self):
+        if not self.tabview:
+            return
+
+        if self._rlhf_is_supported() and "RLHF" not in self.tabview._tab_dict:
+            self.rlhf_tab = RLHFTab(self.tabview.add("RLHF"), self.train_config, self.ui_state, train_ui=self)
+        elif self._rlhf_is_supported() and self.rlhf_tab:
+            self.rlhf_tab.refresh_ui()
+        elif not self._rlhf_is_supported() and "RLHF" in self.tabview._tab_dict:
+            self.tabview.delete("RLHF")
+            self.rlhf_tab = None
+
     def load_preset(self):
         if not self.tabview:
             return
 
         if self.additional_embeddings_tab:
             self.additional_embeddings_tab.refresh_ui()
+
+        self.change_training_method(self.train_config.training_method)
 
     def open_tensorboard(self):
         webbrowser.open("http://localhost:" + str(self.train_config.tensorboard_port), new=0, autoraise=False)
@@ -678,6 +719,10 @@ class TrainUI(ctk.CTk):
     def open_profiling_tool(self):
         self.profiling_window.deiconify()
 
+    def open_dpo_curation_tool(self):
+        from modules.ui.DPOCurationWindow import DPOCurationWindow
+        DPOCurationWindow(self)
+
     def generate_debug_package(self):
         zip_path = filedialog.askdirectory(
             initialdir=".",
@@ -722,6 +767,7 @@ class TrainUI(ctk.CTk):
             on_update_train_progress=self.on_update_train_progress,
             on_update_status=self.on_update_status,
         )
+        self.training_callbacks.set_on_internal_state_changed(self.__on_trainer_internal_state)
 
         trainer = create.create_trainer(self.train_config, self.training_callbacks, self.training_commands, reattach=self.cloud_tab.reattach)
         try:
@@ -740,6 +786,18 @@ class TrainUI(ctk.CTk):
             traceback.print_exc()
 
         trainer.end()
+
+        # Interactive cleanup: remove pair folders and concept entries when requested
+        if self.train_config.rlhf_interactive_mode and self.train_config.rlhf_interactive_cleanup_on_stop:
+            try:
+                from modules.util.dpo_curation_util import cleanup_interactive_concepts
+                cleanup_interactive_concepts(
+                    self.train_config.concept_file_name,
+                    self.train_config.rlhf_interactive_pairs_dir,
+                )
+                self.after(0, self.concepts_tab.reload_from_file)
+            except Exception:
+                traceback.print_exc()
 
         # clear gpu memory
         del trainer
@@ -765,6 +823,18 @@ class TrainUI(ctk.CTk):
         if self.training_thread is None:
             self.save_default()
 
+            if self.train_config.rlhf_interactive_mode and self.train_config.rlhf_interactive_pairs_dir:
+                try:
+                    from modules.util.dpo_curation_util import ensure_interactive_concepts
+                    ensure_interactive_concepts(
+                        self.train_config.concept_file_name,
+                        self.train_config.rlhf_interactive_pairs_dir,
+                    )
+                    self.concepts_tab.reload_from_file()
+                except Exception as ex:
+                    messagebox.showerror("Interactive Setup Error", str(ex))
+                    return
+
             # --- pre-training validation gate ---
             errors = flush_and_validate_all()
 
@@ -787,9 +857,26 @@ class TrainUI(ctk.CTk):
             self.training_thread = threading.Thread(target=self.__training_thread_function)
             self.training_thread.start()
         else:
-            self._set_training_button_stopping()
-            self.on_update_status("Stopping ...")
-            self.training_commands.stop()
+            if self._is_waiting:
+                # Block resume if pair count is below batch_size — OneTrainer would drop incomplete batches and learn nothing
+                if self.train_config.rlhf_interactive_pairs_dir:
+                    pair_count = len(glob.glob(os.path.join(
+                        self.train_config.rlhf_interactive_pairs_dir, "chosen", "pair_*.png"
+                    )))
+                    batch_size = self.train_config.batch_size
+                    if pair_count < batch_size:
+                        messagebox.showwarning(
+                            "Cannot Resume",
+                            f"Need at least {batch_size} pairs to resume (current: {pair_count}). Generate more pairs first."
+                        )
+                        return
+                # Trainer is in wait-for-resume state; send resume signal.
+                self.training_commands.resume()
+                # UI state will be updated by on_internal_state_changed("running") callback.
+            else:
+                self._set_training_button_stopping()
+                self.on_update_status("Stopping ...")
+                self.training_commands.stop()
 
     def save_default(self):
         self.top_bar_component.save_default()
@@ -893,13 +980,70 @@ class TrainUI(ctk.CTk):
         style = self._TRAIN_BUTTON_STYLES.get(mode)
         if not style:
             return
+        if self._main_start_button_locked and style.get("state") == "normal":
+            style = dict(style, state="disabled", fg_color="#6c757d", hover_color="#6c757d")
         self.training_button.configure(**style)
 
+    def lock_main_start_button(self):
+        """Disable the main Start/Stop/Ready button while PairBuilder is open."""
+        self._main_start_button_locked = True
+        self.training_button.configure(state="disabled")
+
+    def unlock_main_start_button(self):
+        """Re-enable the main Start/Stop/Ready button and restore state to match current mode."""
+        self._main_start_button_locked = False
+        if self._is_waiting:
+            self._set_training_button_style("waiting")
+        elif self.training_thread is not None:
+            self._set_training_button_style("running")
+        else:
+            self._set_training_button_style("idle")
+
+    def add_training_state_listener(self, listener):
+        """Register a callback that receives training state changes.
+        State strings: 'running', 'stopping', 'idle'."""
+        if listener not in self._training_state_listeners:
+            self._training_state_listeners.append(listener)
+
+    def remove_training_state_listener(self, listener):
+        if listener in self._training_state_listeners:
+            self._training_state_listeners.remove(listener)
+
+    def _broadcast_training_state(self, state: str):
+        for listener in list(self._training_state_listeners):
+            try:
+                listener(state)
+            except Exception:
+                pass
+
+    def get_current_runtime(self):
+        """Return (callbacks, commands) tuple for the currently running training session.
+        Returns (None, None) if training is not active."""
+        callbacks = getattr(self, "training_callbacks", None)
+        commands = getattr(self, "training_commands", None)
+        return callbacks, commands
+
     def _set_training_button_idle(self):
+        self._is_waiting = False
         self._set_training_button_style("idle")
+        self._broadcast_training_state("idle")
 
     def _set_training_button_running(self):
+        self._is_waiting = False
         self._set_training_button_style("running")
+        self._broadcast_training_state("running")
 
     def _set_training_button_stopping(self):
         self._set_training_button_style("stopping")
+        self._broadcast_training_state("stopping")
+
+    def _set_training_button_waiting(self):
+        self._is_waiting = True
+        self._set_training_button_style("waiting")
+        self._broadcast_training_state("waiting")
+
+    def __on_trainer_internal_state(self, state: str):
+        if state == "waiting":
+            self.after(0, self._set_training_button_waiting)
+        elif state == "running":
+            self.after(0, self._set_training_button_running)

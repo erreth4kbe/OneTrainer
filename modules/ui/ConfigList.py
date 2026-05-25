@@ -287,6 +287,15 @@ class ConfigList(metaclass=ABCMeta):
             self._create_element_list()
         self.save_current_config()
 
+    def reload_from_file(self) -> None:
+        """Re-read the currently attached external file to sync memory/UI.
+        Call this explicitly when an external process modifies the file."""
+        if not self.from_external_file:
+            return
+        filename = getattr(self.train_config, self.attr_name)
+        if filename and os.path.isfile(filename):
+            self.__load_current_config(filename)
+
     def __load_current_config(self, filename):
         try:
             with open(filename, "r") as f:

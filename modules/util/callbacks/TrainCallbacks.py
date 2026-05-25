@@ -14,6 +14,7 @@ class TrainCallbacks:
             on_update_sample_default_progress: Callable[[int, int], None] = lambda _, __: None,
             on_sample_custom: Callable[[ModelSamplerOutput], None] = lambda _: None,
             on_update_sample_custom_progress: Callable[[int, int], None] = lambda _, __: None,
+            on_internal_state_changed: Callable[[str], None] = lambda _: None,
     ):
         self.__on_update_train_progress = on_update_train_progress
         self.__on_update_status = on_update_status
@@ -21,6 +22,7 @@ class TrainCallbacks:
         self.__on_update_sample_default_progress = on_update_sample_default_progress
         self.__on_sample_custom = on_sample_custom
         self.__on_update_sample_custom_progress = on_update_sample_custom_progress
+        self.__on_internal_state_changed = on_internal_state_changed
 
     # on_update_train_progress
     def set_on_update_train_progress(
@@ -93,3 +95,15 @@ class TrainCallbacks:
         if self.__on_update_sample_custom_progress:
             with contextlib.suppress(Exception):
                 self.__on_update_sample_custom_progress(progress, max_progress)
+
+    # on_internal_state_changed
+    def set_on_internal_state_changed(
+            self,
+            on_internal_state_changed: Callable[[str], None] = lambda _: None,
+    ):
+        self.__on_internal_state_changed = on_internal_state_changed
+
+    def on_internal_state_changed(self, state: str):
+        if self.__on_internal_state_changed:
+            with contextlib.suppress(Exception):
+                self.__on_internal_state_changed(state)
