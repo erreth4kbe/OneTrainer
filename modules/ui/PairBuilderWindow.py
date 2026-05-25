@@ -197,6 +197,7 @@ class PairBuilderWindow(ctk.CTkToplevel):
             messagebox.showinfo(
                 "Pair Builder",
                 "Start Training first — pairs can only be generated while training is running or in Ready state.",
+                parent=self,
             )
             return
 
@@ -316,7 +317,7 @@ class PairBuilderWindow(ctk.CTkToplevel):
         """Save the selected slot as chosen and the other as rejected into pair_NNNNN files."""
         if self._original_image_a is None or self._original_image_b is None:
             from tkinter import messagebox
-            messagebox.showwarning("Pair Builder", "Generate two images with Generate Pair first.")
+            messagebox.showwarning("Pair Builder", "Generate two images with Generate Pair first.", parent=self)
             return
 
         chosen = self._original_image_a if chosen_slot == "A" else self._original_image_b
@@ -325,7 +326,7 @@ class PairBuilderWindow(ctk.CTkToplevel):
         pairs_dir = self.train_config.rlhf_interactive_pairs_dir
         if not pairs_dir:
             from tkinter import messagebox
-            messagebox.showerror("Pair Builder", "Interactive Pairs Folder must be set in the RLHF tab first.")
+            messagebox.showerror("Pair Builder", "Interactive Pairs Folder must be set in the RLHF tab first.", parent=self)
             return
 
         chosen_dir = os.path.join(pairs_dir, "chosen")
@@ -383,7 +384,7 @@ class PairBuilderWindow(ctk.CTkToplevel):
     def __on_train_button_clicked(self):
         if self.train_ui is None:
             from tkinter import messagebox
-            messagebox.showerror("Training", "TrainUI reference not available")
+            messagebox.showerror("Training", "TrainUI reference not available", parent=self)
             return
         self.train_ui.start_training()
 
