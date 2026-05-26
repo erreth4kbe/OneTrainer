@@ -81,7 +81,7 @@ Migration: `__migration_16`이 네 필드 setdefault.
 - Interactive Pairs Folder 입력 + Browse (`rlhf_interactive_pairs_dir`)
 - Open Pair Builder 버튼
 
-## Pair Builder 팝업 (`modules/ui/PairBuilderWindow.py`)
+## Pair Builder 팝업 (`modules/ui/DPOPairBuilderWindow.py`)
 
 SampleWindow 베이스가 아닌 자체 구현. 신규 ~470줄.
 
@@ -252,7 +252,7 @@ project_root/               (OneTrainer 포크 = 이 디렉토리)
 | 1-B | GenericTrainer 외부 loop 루프 | ✅ |
 | 1-C-1 | ensure_interactive_concepts + reload_from_file | ✅ |
 | 1-C-2 | RLHF 탭 Pairs Folder 입력 | ✅ |
-| 1-C-3 | PairBuilderWindow 신규 + 진입 버튼 | ✅ |
+| 1-C-3 | DPOPairBuilderWindow 신규 + 진입 버튼 | ✅ |
 | 1-C-4 | Start/Stop 양방향 동기화 | ✅ |
 | 1-D-1 | TrainCommands.resume() + TrainConfig 추가 필드 | ✅ |
 | 1-D-2 | GenericTrainer wait 모드 + TrainUI "waiting" 스타일 | ✅ |

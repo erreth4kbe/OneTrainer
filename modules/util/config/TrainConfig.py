@@ -551,6 +551,9 @@ class TrainConfig(BaseConfig):
     rlhf_interactive_total_loops: int
     rlhf_interactive_pairs_dir: str
     rlhf_interactive_cleanup_on_stop: bool
+    rlhf_interactive_prompt_pool_dir: str
+    rlhf_interactive_prompt_pool_auto: bool
+    rlhf_interactive_sample: SampleConfig
 
     # optimizer
     optimizer: TrainOptimizerConfig
@@ -874,6 +877,9 @@ class TrainConfig(BaseConfig):
         migrated_data.setdefault("rlhf_interactive_total_loops", 1)
         migrated_data.setdefault("rlhf_interactive_pairs_dir", "")
         migrated_data.setdefault("rlhf_interactive_cleanup_on_stop", False)
+        migrated_data.setdefault("rlhf_interactive_prompt_pool_dir", "")
+        migrated_data.setdefault("rlhf_interactive_prompt_pool_auto", False)
+        migrated_data.setdefault("rlhf_interactive_sample", {})
         return migrated_data
 
     def effective_dpo_ref_mode(self) -> DPORefMode:
@@ -1265,6 +1271,9 @@ class TrainConfig(BaseConfig):
         data.append(("rlhf_interactive_total_loops", 1, int, False))
         data.append(("rlhf_interactive_pairs_dir", "", str, False))
         data.append(("rlhf_interactive_cleanup_on_stop", False, bool, False))
+        data.append(("rlhf_interactive_prompt_pool_dir", "", str, False))
+        data.append(("rlhf_interactive_prompt_pool_auto", False, bool, False))
+        data.append(("rlhf_interactive_sample", SampleConfig.default_values(), SampleConfig, False))
 
         # optimizer
         data.append(("optimizer", TrainOptimizerConfig.default_values(), TrainOptimizerConfig, False))

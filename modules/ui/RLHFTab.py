@@ -263,7 +263,7 @@ class RLHFTab:
         DPOBucketAnalysisWindow(self.master.winfo_toplevel(), self.train_config)
 
     def _open_pair_builder(self):
-        """Open PairBuilderWindow only when Interactive Mode is enabled and pairs_dir is set."""
+        """Open DPOPairBuilderWindow only when Interactive Mode is enabled and pairs_dir is set."""
         if not self.train_config.rlhf_interactive_mode:
             messagebox.showerror("Pair Builder", "Interactive Mode must be enabled first.")
             return
@@ -275,8 +275,8 @@ class RLHFTab:
         if self.train_ui is not None:
             callbacks, commands = self.train_ui.get_current_runtime()
 
-        from modules.ui.PairBuilderWindow import PairBuilderWindow
-        PairBuilderWindow(
+        from modules.ui.DPOPairBuilderWindow import DPOPairBuilderWindow
+        DPOPairBuilderWindow(
             self.master.winfo_toplevel(),
             self.train_config,
             callbacks=callbacks,
