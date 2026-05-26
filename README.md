@@ -1,3 +1,53 @@
+# OneTrainer — Interactive DPO Fork
+
+> Personal fork of [Nerogar/OneTrainer](https://github.com/Nerogar/OneTrainer) that adds an **Interactive DPO** mode on top of [PR #1403 (Diffusion-DPO)](https://github.com/Nerogar/OneTrainer/pull/1403).
+>
+> The upstream README is preserved below — read it for installation, supported models, and CLI usage. Everything in this section is what this fork adds.
+
+## What this fork adds
+
+Upstream PR #1403 brings Diffusion-DPO loss with pre-curated `chosen/` / `rejected/` pair folders. This fork makes the loop **interactive** — you generate, evaluate, and absorb new pairs without ever leaving the training session.
+
+- **Pair Builder window** — opens from the RLHF tab. Generates two images for the same prompt with independent random cfg-scale deltas (A = current LoRA, B = reference / frozen snapshot), then lets you **Pick A / Pick B / Pass** to register the preference pair.
+- **Interactive loop mode** — wraps the existing epoch loop. One outer loop = your `epochs` setting. At every loop boundary the trainer rebuilds the dataloader so pairs added through Pair Builder are absorbed without restarting. `Total Loops` controls how many to run (`-1` = run until Stop).
+- **Wait / Ready state** — the first loop pauses at step 0 until you've seeded at least one batch of pairs and click Ready to resume.
+- **Auto pair-folder registration** — `chosen/` and `rejected/` subfolders and matching concept entries are created automatically when Interactive Mode is enabled.
+- **Prompt pool** — point at a folder of `.txt` files and toggle **auto load** to have each Generate Pair pick a random prompt for you.
+- **Input persistence** — Pair Builder's prompt / cfg / seed / sampler / steps / etc. are stored inside the main TrainConfig, so reopening the window (or loading a saved preset) restores your last settings.
+- **Main Start lock** — while Pair Builder is open, the main window's Start button greys out so the two windows can't fight over the training thread.
+
+## Status
+
+PR #1403 is still under review upstream. This fork tracks `Nerogar/OneTrainer` master and rebases the DPO + interactive patches on top.
+
+- Interactive mode is feature-complete and undergoing real-use testing.
+- If PR #1403 merges upstream, the interactive layer becomes the only delta and may be proposed separately.
+- Until then, use this fork directly if you want Interactive DPO.
+
+See [`CLAUDE.md`](CLAUDE.md) for the design doc, architecture notes, and per-feature breakdown.
+
+## Quick start — Interactive DPO
+
+1. Install per the upstream instructions in the section below.
+2. In the **RLHF tab**:
+   - Enable RLHF, select DPO mode.
+   - Toggle **Interactive Mode** on.
+   - Set **Interactive Pairs Folder** — where pairs are dumped (`chosen/` / `rejected/` are created here).
+   - (Optional) Set **Total Loops** (`-1` = infinite, run until Stop).
+3. Click **Open Pair Builder**. The main Start button locks while it's open.
+4. Click **Start Training** inside Pair Builder → trainer loads the model and enters **Ready** state (the button turns blue).
+5. Enter a prompt (or set a Prompt Pool folder and flip **auto load**), then click **Generate Pair**. Pick A / Pick B / Pass.
+6. Once at least `batch_size` pairs are in `chosen/`, click the **Ready** button to resume into the first training step.
+7. New pairs created mid-training are picked up automatically at the next loop boundary.
+
+## Compatibility
+
+- Built on top of unmerged PR #1403, so applying this fork on plain `Nerogar/OneTrainer` master requires that PR first. The fork's `master` already contains both.
+- Tested on Windows 11 + RTX 5090 + Python 3.12 (OneTrainer venv). Z-Image base model. Other base models should work but are untested with the interactive flow.
+- DPO only. Other RLHF methods aren't wired into the interactive flow.
+
+---
+
 # OneTrainer
 
 OneTrainer is a one-stop solution for all your Diffusion training needs.

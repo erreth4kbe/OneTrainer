@@ -40,5 +40,6 @@ config_diff.txt
 
 # personal scratch (test logs, local notes, etc.)
 _test*
+_task*
 *.local.*
 *.scratch
